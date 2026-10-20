@@ -264,20 +264,27 @@ fn file_input(v: &Value) -> Result<Value, String> {
     use base64::Engine;
     if let Some(data) = v.get("data") {
         let data = data.as_str().ok_or("the file's data must be base64 text")?;
-        if !is_base64(data) {
-            return Err("the file's data must be base64 text".into());
-        }
-        // The decoded size, exactly, without decoding it.
-        let padding = data.bytes().rev().take_while(|&c| c == b'=').count();
-        if (data.len() / 4 * 3).saturating_sub(padding) > MAX_FILE {
-            return Err(too_big());
-        }
+        check_base64(data)?;
         let name = v.get("name").and_then(Value::as_str).map(base_name).filter(|n| !n.is_empty()).unwrap_or("file");
         return Ok(json!({"name": name, "data": data}));
     }
     let path = v.as_str().ok_or("give a file path")?;
     let bytes = read_file(path)?;
     Ok(json!({"name": base_name(path), "data": base64::engine::general_purpose::STANDARD.encode(bytes)}))
+}
+
+/// Whether `data` is base64 text whose decoded size is within [`MAX_FILE`], checked without
+/// decoding it.
+fn check_base64(data: &str) -> Result<(), String> {
+    if !is_base64(data) {
+        return Err("the file's data must be base64 text".into());
+    }
+    // The decoded size, exactly, without decoding it.
+    let padding = data.bytes().rev().take_while(|&c| c == b'=').count();
+    if (data.len() / 4 * 3).saturating_sub(padding) > MAX_FILE {
+        return Err(too_big());
+    }
+    Ok(())
 }
 
 /// Whether `s` is standard, padded base64 (checked without decoding it).
@@ -327,10 +334,24 @@ pub fn file_extensions(tool: &str, param: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Reads a dataset a tool returned: `{"name": "...", "geojson": {FeatureCollection}}`.
+/// The file types an output layer can come as (vector files, read from memory by
+/// [`rustgis_data::io::read_owned`]).
+const OUTPUT_EXTENSIONS: [&str; 6] = ["fgb", "parquet", "geoparquet", "gpkg", "geojson", "json"];
+
+/// Reads a dataset a tool returned: `{"name": "...", "geojson": {FeatureCollection}}`, or a
+/// vector file instead of the GeoJSON, `{"name": "...", "file": "track.fgb", "data": "<base64>"}`
+/// (FlatGeobuf, GeoParquet, GeoPackage or GeoJSON), which a large layer needs: the host then
+/// holds the file's bytes and the features, not also a copy of the reply as text and as a JSON tree.
+/// A file holding several layers (a GeoPackage) gives its first, as a dropped file does.
 fn dataset(v: &Value, fallback: &str) -> Result<rustgis_data::Dataset, String> {
     let name = v.get("name").and_then(Value::as_str).filter(|n| !n.trim().is_empty()).unwrap_or(fallback);
-    let gj = v.get("geojson").ok_or_else(|| format!("{name}: an output has no 'geojson'"))?;
+    if v.get("file").is_some() {
+        if v.get("geojson").is_some() {
+            return Err(format!("{name}: an output has 'geojson' or 'file', not both"));
+        }
+        return file_dataset(v, name);
+    }
+    let gj = v.get("geojson").ok_or_else(|| format!("{name}: an output has no 'geojson' or 'file'"))?;
     if gj.get("features").and_then(Value::as_array).is_some_and(|f| f.len() > MAX_FEATURES) {
         return Err(format!("{name}: too many features"));
     }
@@ -338,9 +359,28 @@ fn dataset(v: &Value, fallback: &str) -> Result<rustgis_data::Dataset, String> {
     Ok(ds)
 }
 
+/// The dataset in an output's `file` (its name, for the type) and `data` (base64).
+fn file_dataset(v: &Value, name: &str) -> Result<rustgis_data::Dataset, String> {
+    use base64::Engine;
+    let file = v.get("file").and_then(Value::as_str).map(base_name).unwrap_or_default();
+    let ext = file.rsplit_once('.').map_or("", |(_, e)| e).to_ascii_lowercase();
+    if !OUTPUT_EXTENSIONS.contains(&ext.as_str()) {
+        return Err(format!("{name}: an output file must be one of: {}", OUTPUT_EXTENSIONS.join(", ")));
+    }
+    let data = v.get("data").and_then(Value::as_str).ok_or_else(|| format!("{name}: an output file has no base64 'data'"))?;
+    check_base64(data).map_err(|e| format!("{name}: {e}"))?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(data).map_err(|e| format!("{name}: {e}"))?;
+    let (mut ds, _) = rustgis_data::io::read_owned(file, bytes).map_err(|e| format!("{name}: {e}"))?;
+    if ds.features.len() > MAX_FEATURES {
+        return Err(format!("{name}: too many features"));
+    }
+    ds.name = name.to_string();
+    Ok(ds)
+}
+
 /// Turns a tool's reply into a result: new `layers` and `tables`, or a `selection`
 /// (`{"layer": name, "rows": [...]}`), with `messages`.
-fn output(reply: &Value, tool: &str) -> Result<ToolResult, String> {
+pub(crate) fn output(reply: &Value, tool: &str) -> Result<ToolResult, String> {
     let messages: Vec<String> = reply
         .get("messages")
         .and_then(Value::as_array)

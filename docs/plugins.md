@@ -403,6 +403,26 @@ selected features when a layer has a selection), and its `file` parameters' file
 selection, plus messages for the Geoprocessing history. RustGIS adds the results as it does for
 built-in tools, with undo. Tools can log, but they make no host requests.
 
+An output layer is GeoJSON by default. A large layer is better returned as a file, which
+RustGIS reads from memory without making a text copy of every feature first, which needs a
+fraction of the memory (a few hundred thousand points take gigabytes as GeoJSON). The file is
+limited to 64 MB, though: a FlatGeobuf point with two numeric fields takes about 100 bytes, so
+that holds some 600,000 points. Give `file` and `data` instead of `geojson`:
+
+```json
+{"ok": {"layers": [{"name": "Track", "file": "track.fgb", "data": "<base64 of the file>"}]}}
+```
+
+- `file` is a name whose extension says the format: `fgb` (FlatGeobuf), `parquet` or
+  `geoparquet`, `gpkg`, `geojson` or `json`. Other types (Shapefiles, zip archives, point
+  clouds) are refused.
+- `data` is the file's contents in base64, at most 64 MB (decoded) and 5 million features.
+  A Parquet, FlatGeobuf or GeoPackage file is read as when it is opened or dropped, so it gives
+  at most the first 2 million features (500,000 in the web app).
+- If the file holds several layers (a GeoPackage), the first is used.
+- An output has `geojson` or `file`, not both. `name` works as for GeoJSON; the file's own
+  name is not used. This applies to `tables` too.
+
 In the desktop app a plugin tool runs in the background, so the map and the rest of the window
 stay usable: the Tools pane shows the line the tool last logged, or a process plugin's last
 `progress` message, and a **Cancel** button. Cancel stops a process plugin's program; a WebAssembly tool runs on to its
@@ -436,7 +456,8 @@ Tools also get `layers`, which maps each layer's name to its FeatureCollection, 
 they have `file` parameters, `files`, which maps each one's name to `{"name", "data"}` with the
 file's contents in base64. A tool's `ok`
 value is `{"layers": [{"name", "geojson"}], "tables": [...], "selection": {"layer", "rows"},
-"messages": [...]}`.
+"messages": [...]}`. A layer or table gives its features as `geojson`, or as a vector file,
+`{"name", "file", "data"}` (see above).
 
 Each call gets a fresh instance, so a module keeps no state between calls and need not free
 memory. The fuel budget is about 2×10⁹ instructions for a command and 4×10¹⁰ for a tool.

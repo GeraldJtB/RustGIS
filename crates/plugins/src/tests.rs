@@ -1062,3 +1062,100 @@ fn python_environments_are_prepared_one_at_a_time() {
     crate::unload("pyenv-lock");
     let _ = std::fs::remove_dir_all(&plugins);
 }
+
+// ---------------------------------------------------------------------------------------------
+// a tool's output layers as files
+
+/// Three points with a text and a number field, as GeoJSON.
+fn track_dataset() -> rustgis_data::Dataset {
+    let gj = r#"{"type":"FeatureCollection","features":[
+        {"type":"Feature","properties":{"label":"a","speed":1.5},"geometry":{"type":"Point","coordinates":[8.0,52.0]}},
+        {"type":"Feature","properties":{"label":"b","speed":2.5},"geometry":{"type":"Point","coordinates":[8.1,52.1]}},
+        {"type":"Feature","properties":{"label":"c","speed":3.5},"geometry":{"type":"Point","coordinates":[8.2,52.2]}}]}"#;
+    rustgis_data::io::read_geojson(gj, "track").unwrap().0
+}
+
+/// A reply with one output layer.
+fn layer_reply(layer: Value) -> Value {
+    json!({"layers": [layer]})
+}
+
+fn vector(reply: &Value) -> Result<rustgis_data::Dataset, String> {
+    match crate::tools::output(reply, "tool")?.output {
+        rustgis_analysis::Output::Layers(mut l) => match l.remove(0) {
+            rustgis_analysis::OutputLayer::Vector(ds) => Ok(ds),
+            _ => Err("not a vector".into()),
+        },
+        _ => Err("not layers".into()),
+    }
+}
+
+#[test]
+fn output_layer_from_a_file() {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let want = track_dataset();
+    for ext in ["fgb", "parquet", "geoparquet", "geojson"] {
+        let (bytes, _) = rustgis_data::io::write_bytes(&want, ext).unwrap();
+        let reply = layer_reply(json!({"name": "Track", "file": format!("track.{ext}"), "data": b64.encode(bytes)}));
+        let ds = vector(&reply).unwrap_or_else(|e| panic!("{ext}: {e}"));
+        assert_eq!(ds.name, "Track", "{ext}");
+        assert_eq!(ds.features.len(), 3, "{ext}");
+        let label = ds.field_index("label").unwrap_or_else(|| panic!("{ext}: no label field"));
+        let speed = ds.field_index("speed").unwrap_or_else(|| panic!("{ext}: no speed field"));
+        assert_eq!((want.field_index("label"), want.field_index("speed")), (Some(label), Some(speed)), "{ext}");
+        // FlatGeobuf keeps its features in the order of its spatial index: pair them by label.
+        let key = |ds: &rustgis_data::Dataset| {
+            let mut rows: Vec<(String, String)> =
+                ds.features.iter().map(|f| (f.attrs[label].to_string(), f.attrs[speed].to_string())).collect();
+            rows.sort();
+            rows
+        };
+        assert_eq!(key(&ds), key(&want), "{ext}");
+        assert!(ds.features.iter().all(|f| f.geometry.is_some()), "{ext}");
+    }
+    // Without a name, the layer takes the tool's name, as a GeoJSON output does.
+    let (bytes, _) = rustgis_data::io::write_bytes(&want, "fgb").unwrap();
+    let reply = layer_reply(json!({"file": "track.fgb", "data": b64.encode(bytes)}));
+    assert_eq!(vector(&reply).unwrap().name, "tool");
+    // The same goes for a table.
+    let (bytes, _) = rustgis_data::io::write_bytes(&want, "fgb").unwrap();
+    let reply = json!({"tables": [{"name": "T", "file": "t.fgb", "data": b64.encode(bytes)}]});
+    assert!(
+        matches!(crate::tools::output(&reply, "tool").unwrap().output, rustgis_analysis::Output::Layers(l) if matches!(l[0], rustgis_analysis::OutputLayer::Table(_)))
+    );
+}
+
+#[test]
+fn output_layer_file_is_checked() {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let (fgb, _) = rustgis_data::io::write_bytes(&track_dataset(), "fgb").unwrap();
+    let data = b64.encode(&fgb);
+    // Only vector files: no point clouds, archives or Shapefile parts, and a file needs a name.
+    for bad in ["cloud.laz", "a.zip", "a.shp", "a.csv", "a.kml", "noextension", ""] {
+        let e = vector(&layer_reply(json!({"name": "x", "file": bad, "data": data}))).unwrap_err();
+        assert!(e.contains("fgb, parquet, geoparquet, gpkg, geojson, json"), "{bad}: {e}");
+    }
+    // `geojson` and `file` are alternatives.
+    let both = layer_reply(json!({"name": "x", "file": "t.fgb", "data": data, "geojson": {"type": "FeatureCollection", "features": []}}));
+    assert!(vector(&both).unwrap_err().contains("not both"));
+    // A file needs its data, as base64, within the size limit (the decoded size, to the byte).
+    assert!(vector(&layer_reply(json!({"name": "x", "file": "t.fgb"}))).is_err());
+    for bad in [json!(7), json!("not base64!"), json!("abc")] {
+        assert!(vector(&layer_reply(json!({"name": "x", "file": "t.fgb", "data": bad}))).is_err(), "{bad}");
+    }
+    let big = b64.encode(vec![0u8; crate::tools::MAX_FILE + 1]);
+    assert!(vector(&layer_reply(json!({"name": "x", "file": "t.fgb", "data": big}))).unwrap_err().contains("larger"));
+    // Bytes that aren't the file they say they are are an error, not a crash.
+    assert!(vector(&layer_reply(json!({"name": "x", "file": "t.fgb", "data": b64.encode("hello")}))).is_err());
+}
+
+#[test]
+fn output_layer_geojson_is_unchanged() {
+    let reply = layer_reply(json!({"name": "G", "geojson": {"type": "FeatureCollection", "features": [
+        {"type": "Feature", "properties": {"n": 1}, "geometry": {"type": "Point", "coordinates": [1, 2]}}]}}));
+    let ds = vector(&reply).unwrap();
+    assert_eq!((ds.name.as_str(), ds.features.len()), ("G", 1));
+    assert!(vector(&layer_reply(json!({"name": "G"}))).unwrap_err().contains("'geojson'"));
+}
